@@ -5,6 +5,7 @@
  */
 
 import assert from 'node:assert';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, it} from 'node:test';
@@ -20,6 +21,7 @@ import {
   createMockPuppeteerBrowser,
 } from './mocks.js';
 import {serverHooks} from './server.js';
+import {createTempDir} from './utils.js';
 
 async function safeClose(browser: Browser) {
   try {
@@ -191,6 +193,162 @@ describe('browser', () => {
 
       assert.strictEqual(browser, pptrBrowser);
       sinon.assert.calledTwice(launchStub);
+    });
+
+    describe('when the profile is locked', () => {
+      const lockedError = (dir: string) =>
+        new Error(
+          `The browser is already running for ${dir}. Use a different \`userDataDir\` or stop the running browser first.`,
+        );
+
+      function fillLockedProfile(dir: string): void {
+        fs.mkdirSync(path.join(dir, 'Default', 'Cache'), {recursive: true});
+        fs.mkdirSync(path.join(dir, 'Default', 'Code Cache'), {
+          recursive: true,
+        });
+        fs.writeFileSync(path.join(dir, 'Default', 'Cookies'), 'cookies');
+        fs.writeFileSync(path.join(dir, 'Default', 'Cache', 'blob'), 'cache');
+        fs.writeFileSync(path.join(dir, 'Local State'), '{}');
+        fs.symlinkSync('otherhost-12345', path.join(dir, 'SingletonLock'));
+      }
+
+      it('fails with the lock error by default', async () => {
+        using profileDir = createTempDir('locked-profile-');
+        const profile = profileDir.path;
+        fillLockedProfile(profile);
+        const launchStub = sinon
+          .stub(puppeteer, 'launch')
+          .rejects(lockedError(profile));
+        const manager = new BrowserManager(
+          createMockParsedArguments({userDataDir: profile}),
+        );
+
+        await assert.rejects(
+          manager.ensureBrowser(),
+          new RegExp(`The browser is already running for ${profile}`),
+        );
+        sinon.assert.calledOnce(launchStub);
+      });
+
+      it('falls back to a temporary profile with userDataDirOnLock=isolated', async () => {
+        using profileDir = createTempDir('locked-profile-');
+        const profile = profileDir.path;
+        fillLockedProfile(profile);
+        const pptrBrowser = createMockPuppeteerBrowser();
+        const launchStub = sinon.stub(puppeteer, 'launch');
+        launchStub.onFirstCall().rejects(lockedError(profile));
+        launchStub.onSecondCall().resolves(pptrBrowser);
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: profile,
+            userDataDirOnLock: 'isolated',
+          }),
+        );
+
+        assert.strictEqual(await manager.ensureBrowser(), pptrBrowser);
+        sinon.assert.calledTwice(launchStub);
+        assert.strictEqual(
+          launchStub.secondCall.args[0]?.userDataDir,
+          undefined,
+        );
+      });
+
+      it('launches on a private copy without caches or lock files with userDataDirOnLock=copy', async () => {
+        using profileDir = createTempDir('locked-profile-');
+        const profile = profileDir.path;
+        fillLockedProfile(profile);
+        const pptrBrowser = createMockPuppeteerBrowser();
+        const launchStub = sinon.stub(puppeteer, 'launch');
+        launchStub.onFirstCall().rejects(lockedError(profile));
+        launchStub.onSecondCall().resolves(pptrBrowser);
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: profile,
+            userDataDirOnLock: 'copy',
+          }),
+        );
+
+        await manager.ensureBrowser();
+
+        const copy = launchStub.secondCall.args[0]?.userDataDir;
+        assert.ok(copy);
+        assert.notStrictEqual(copy, profile);
+        assert.strictEqual(fs.statSync(copy).mode & 0o777, 0o700);
+        assert.strictEqual(
+          fs.readFileSync(path.join(copy, 'Default', 'Cookies'), 'utf8'),
+          'cookies',
+        );
+        assert.ok(fs.existsSync(path.join(copy, 'Local State')));
+        assert.ok(!fs.existsSync(path.join(copy, 'Default', 'Cache')));
+        assert.ok(!fs.existsSync(path.join(copy, 'Default', 'Code Cache')));
+        assert.ok(!fs.existsSync(path.join(copy, 'SingletonLock')));
+      });
+
+      it('removes the profile copy once the browser disconnects', async () => {
+        using profileDir = createTempDir('locked-profile-');
+        const profile = profileDir.path;
+        fillLockedProfile(profile);
+        const pptrBrowser = createMockPuppeteerBrowser();
+        const launchStub = sinon.stub(puppeteer, 'launch');
+        launchStub.onFirstCall().rejects(lockedError(profile));
+        launchStub.onSecondCall().resolves(pptrBrowser);
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: profile,
+            userDataDirOnLock: 'copy',
+          }),
+        );
+
+        await manager.ensureBrowser();
+        const copy = launchStub.secondCall.args[0]?.userDataDir;
+        assert.ok(copy && fs.existsSync(copy));
+
+        pptrBrowser.emit('disconnected', undefined);
+
+        for (let i = 0; i < 50 && fs.existsSync(copy); i++) {
+          await new Promise(r => setTimeout(r, 20));
+        }
+        assert.ok(!fs.existsSync(copy));
+        assert.ok(fs.existsSync(path.join(profile, 'Default', 'Cookies')));
+      });
+
+      it('removes the profile copy when launching on it fails', async () => {
+        using profileDir = createTempDir('locked-profile-');
+        const profile = profileDir.path;
+        fillLockedProfile(profile);
+        const launchStub = sinon.stub(puppeteer, 'launch');
+        launchStub.onFirstCall().rejects(lockedError(profile));
+        launchStub.onSecondCall().rejects(new Error('second launch failed'));
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: profile,
+            userDataDirOnLock: 'copy',
+          }),
+        );
+
+        await assert.rejects(manager.ensureBrowser(), /second launch failed/);
+        const copy = launchStub.secondCall.args[0]?.userDataDir;
+        assert.ok(copy);
+        assert.ok(!fs.existsSync(copy));
+      });
+
+      it('does not retry on errors other than the lock', async () => {
+        using profileDir = createTempDir('locked-profile-');
+        const profile = profileDir.path;
+        fillLockedProfile(profile);
+        const launchStub = sinon
+          .stub(puppeteer, 'launch')
+          .rejects(new Error('some other failure'));
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: profile,
+            userDataDirOnLock: 'copy',
+          }),
+        );
+
+        await assert.rejects(manager.ensureBrowser(), /some other failure/);
+        sinon.assert.calledOnce(launchStub);
+      });
     });
 
     it('reconnects when existing browser is no longer connected', async () => {
@@ -671,8 +829,38 @@ describe('browser', () => {
           assert.ok(err instanceof Error);
           assert.strictEqual(
             err.message,
-            `The browser is already running for ${folderPath}. Use --isolated to run multiple browser instances.`,
+            `The browser is already running for ${folderPath}. Use --isolated or --userDataDirOnLock to run multiple browser instances.`,
           );
+        }
+      } finally {
+        await safeClose(browser1);
+      }
+    });
+  });
+
+  it('launches a second browser on a copy of a locked profile with userDataDirOnLock=copy', async () => {
+    await runWithRetry(async () => {
+      const folderPath = path.join(
+        os.tmpdir(),
+        `temp-folder-${crypto.randomUUID()}`,
+      );
+      const options = {
+        headless: true,
+        isolated: false,
+        userDataDir: folderPath,
+        executablePath: await executablePath(),
+      };
+      const browser1 = await new BrowserManager(
+        createMockParsedArguments(options),
+      ).ensureBrowser();
+      try {
+        const browser2 = await new BrowserManager(
+          createMockParsedArguments({...options, userDataDirOnLock: 'copy'}),
+        ).ensureBrowser();
+        try {
+          assert.ok(browser2.connected);
+        } finally {
+          await safeClose(browser2);
         }
       } finally {
         await safeClose(browser1);

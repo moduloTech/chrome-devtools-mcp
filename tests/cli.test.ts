@@ -38,6 +38,7 @@ describe('cli args parsing', () => {
     autoConnect: false,
     headless: false,
     isolated: false,
+    userDataDirOnLock: 'fail',
     acceptInsecureCerts: false,
     performanceCrux: true,
     usageStatistics: true,

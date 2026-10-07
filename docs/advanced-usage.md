@@ -24,6 +24,20 @@ launch its own temporary Chrome profile, also pass `--isolated`. This avoids
 sharing the default Chrome DevTools MCP user data directory between those
 server instances.
 
+`--isolated` starts every session from an empty profile, so a session loses the
+logins kept in the persistent one. To keep using the persistent profile and only
+deviate when another session holds it, pass `--userDataDirOnLock` instead:
+
+- `--userDataDirOnLock=copy` launches on a private temporary copy of the locked
+  profile (caches left out), so the session starts with the same cookies and
+  storage. Whatever it changes is discarded: the copy is deleted when the browser
+  closes. The copy holds the profile's session cookies; it is created with mode
+  `0700` under the system temporary directory.
+- `--userDataDirOnLock=isolated` falls back to a temporary empty profile, as
+  `--isolated` would.
+- `--userDataDirOnLock=fail` (the default) reports that the browser is already
+  running.
+
 ## User data directory
 
 By default, `chrome-devtools-mcp` starts a Chrome's stable channel instance using the following user
@@ -38,7 +52,8 @@ For non-stable channels, the channel name is appended to the directory name, for
 The user data directory is not cleared between runs and is reused for subsequent
 runs with the same channel. Only one browser can use it at a time. Set the `isolated`
 option to `true` to use a temporary user data directory instead which will be cleared
-automatically after the browser is closed.
+automatically after the browser is closed, or set `userDataDirOnLock` to decide what
+happens when the directory is already in use (see [Concurrent sessions](#concurrent-sessions)).
 
 ## Connecting to a running Chrome instance
 

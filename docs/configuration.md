@@ -94,6 +94,12 @@ The Chrome DevTools MCP server supports the following configuration option:
   Path to the user data directory for Chrome. Default is $HOME/.cache/chrome-devtools-mcp/chrome-profile$CHANNEL_SUFFIX_IF_NON_STABLE
   - **Type:** string
 
+- **`--userDataDirOnLock`/ `--user-data-dir-on-lock`**
+  What to do when the user data directory is already in use by another Chrome instance, e.g. another MCP session: "fail" reports the error; "isolated" falls back to a temporary profile, as --isolated does; "copy" launches on a private temporary copy of the profile (caches excluded), so the session keeps its cookies and logins, and deletes the copy when the browser closes.
+  - **Type:** string
+  - **Choices:** `fail`, `copy`, `isolated`
+  - **Default:** `fail`
+
 - **`--channel`**
   Specify a different Chrome channel that should be used. The default is the stable channel version.
   - **Type:** string

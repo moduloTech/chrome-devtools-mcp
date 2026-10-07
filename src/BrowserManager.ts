@@ -219,6 +219,7 @@ export class BrowserManager {
       allowedUrlPattern: allowlist,
       ignoreDefaultChromeArg,
       proxyServer,
+      userDataDirOnLock = 'fail',
     } = this.#serverArgs;
 
     const profileDirName =
@@ -264,54 +265,71 @@ export class BrowserManager {
       BrowserManager.detectDisplay();
     }
 
-    let browser: Browser | undefined;
-    try {
-      browser = await puppeteer.launch({
-        channel: puppeteerChannel,
-        targetFilter: BrowserManager.makeTargetFilter(enableExtensions),
-        executablePath,
-        defaultViewport: null,
-        userDataDir,
-        pipe: true,
-        headless,
-        args,
-        ignoreDefaultArgs,
-        acceptInsecureCerts,
-        handleDevToolsAsPage: true,
-        enableExtensions,
-        blocklist,
-        allowlist,
-        logger: puppeteerLogger,
-      });
-      if (this.#options.logFile) {
-        // FIXME: we are probably subscribing too late to catch startup logs. We
-        // should expose the process earlier or expose the getRecentLogs() getter.
-        browser.process()?.stderr?.pipe(this.#options.logFile);
-        browser.process()?.stdout?.pipe(this.#options.logFile);
-      }
-      if (viewport) {
-        const [page] = await browser.pages();
-        await page?.resize({
-          contentWidth: viewport.width,
-          contentHeight: viewport.height,
+    const launchOn = async (dir: string | undefined): Promise<Browser> => {
+      let browser: Browser | undefined;
+      try {
+        browser = await puppeteer.launch({
+          channel: puppeteerChannel,
+          targetFilter: BrowserManager.makeTargetFilter(enableExtensions),
+          executablePath,
+          defaultViewport: null,
+          userDataDir: dir,
+          pipe: true,
+          headless,
+          args,
+          ignoreDefaultArgs,
+          acceptInsecureCerts,
+          handleDevToolsAsPage: true,
+          enableExtensions,
+          blocklist,
+          allowlist,
+          logger: puppeteerLogger,
         });
+        if (this.#options.logFile) {
+          // FIXME: we are probably subscribing too late to catch startup logs. We
+          // should expose the process earlier or expose the getRecentLogs() getter.
+          browser.process()?.stderr?.pipe(this.#options.logFile);
+          browser.process()?.stdout?.pipe(this.#options.logFile);
+        }
+        if (viewport) {
+          const [page] = await browser.pages();
+          await page?.resize({
+            contentWidth: viewport.width,
+            contentHeight: viewport.height,
+          });
+        }
+        this.#browserMode = 'launched';
+        this.#browser = browser;
+        const launched = browser;
+        launched.once('disconnected', () => this.#evictIfCurrent(launched));
+        return launched;
+      } catch (error) {
+        await browser?.close().catch(() => {
+          // Best-effort cleanup if post-launch setup failed.
+        });
+        throw error;
       }
-      this.#browserMode = 'launched';
-      this.#browser = browser;
-      const launched = browser;
-      launched.once('disconnected', () => this.#evictIfCurrent(launched));
-      return launched;
+    };
+
+    try {
+      return await launchOn(userDataDir);
     } catch (error) {
-      await browser?.close().catch(() => {
-        // Best-effort cleanup if post-launch setup failed.
-      });
       if (
         userDataDir &&
         error instanceof Error &&
         error.message.includes('The browser is already running')
       ) {
+        if (userDataDirOnLock === 'isolated') {
+          logger?.(
+            `${userDataDir} is locked, launching on a temporary profile`,
+          );
+          return await launchOn(undefined);
+        }
+        if (userDataDirOnLock === 'copy') {
+          return await this.#launchOnProfileCopy(userDataDir, launchOn);
+        }
         throw new Error(
-          `The browser is already running for ${userDataDir}. Use --isolated to run multiple browser instances.`,
+          `The browser is already running for ${userDataDir}. Use --isolated or --userDataDirOnLock to run multiple browser instances.`,
           {
             cause: error,
           },
@@ -325,6 +343,89 @@ export class BrowserManager {
       }
       throw error;
     }
+  }
+
+  async #launchOnProfileCopy(
+    userDataDir: string,
+    launchOn: (dir: string) => Promise<Browser>,
+  ): Promise<Browser> {
+    const copy = await BrowserManager.copyProfile(userDataDir);
+    logger?.(`${userDataDir} is locked, launching on a copy at ${copy}`);
+    const removeCopy = () => {
+      try {
+        fs.rmSync(copy, {recursive: true, force: true, maxRetries: 5});
+      } catch {
+        // Best effort: the process is exiting.
+      }
+    };
+    process.once('exit', removeCopy);
+    let browser: Browser;
+    try {
+      browser = await launchOn(copy);
+    } catch (error) {
+      process.off('exit', removeCopy);
+      removeCopy();
+      throw error;
+    }
+    browser.once('disconnected', () => {
+      // 'disconnected' fires before Chrome has finished writing to the profile;
+      // removing it before the process exits races those writes (ENOTEMPTY).
+      const chrome = browser.process();
+      const onExit = () => {
+        process.off('exit', removeCopy);
+        fs.promises
+          .rm(copy, {recursive: true, force: true, maxRetries: 5})
+          .catch(error => {
+            logger?.(`Could not remove the profile copy at ${copy}: ${error}`);
+          });
+      };
+      if (chrome && chrome.exitCode === null && chrome.signalCode === null) {
+        chrome.once('exit', onExit);
+      } else {
+        onExit();
+      }
+    });
+    return browser;
+  }
+
+  /**
+   * Directory names Chrome regenerates on its own; skipping them keeps the
+   * copy small (they are most of a profile's size) without losing any state.
+   */
+  static readonly profileCopySkippedDirs = new Set([
+    'Cache',
+    'Code Cache',
+    'GPUCache',
+    'GrShaderCache',
+    'GraphiteDawnCache',
+    'ShaderCache',
+    'DawnGraphiteCache',
+    'DawnWebGPUCache',
+    'component_crx_cache',
+    'Crashpad',
+  ]);
+
+  /**
+   * Copies a profile that another Chrome instance holds into a fresh private
+   * temporary directory (mkdtemp creates it with mode 0700), leaving out
+   * caches and the Singleton* files that mark the original as in use.
+   */
+  static async copyProfile(userDataDir: string): Promise<string> {
+    const copy = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), 'chrome-devtools-mcp-profile-'),
+    );
+    await fs.promises.cp(userDataDir, copy, {
+      recursive: true,
+      verbatimSymlinks: true,
+      filter: source => {
+        const name = path.basename(source);
+        return (
+          !name.startsWith('Singleton') &&
+          !BrowserManager.profileCopySkippedDirs.has(name)
+        );
+      },
+    });
+    return copy;
   }
 
   async #connect(): Promise<Browser> {
