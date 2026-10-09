@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert';
-import {spawnSync} from 'node:child_process';
+import {execFileSync, spawnSync} from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -367,11 +367,19 @@ describe('browser', () => {
 
       describe('profile copies', () => {
         const ownerFile = '.chrome-devtools-mcp-owner';
-        const posixOnly =
+        const cannotChmod =
           process.platform === 'win32' || process.getuid?.() === 0;
 
         function deadPid(): number {
           return spawnSync(process.execPath, ['-e', '']).pid;
+        }
+
+        function here(pid: number | string): string {
+          return `${os.hostname()}-${pid}`;
+        }
+
+        function deadHere(): string {
+          return here(deadPid());
         }
 
         function copiesIn(dir: string): string[] {
@@ -435,7 +443,7 @@ describe('browser', () => {
         it(
           'removes a partial copy and rethrows the copy error',
           {
-            skip: posixOnly,
+            skip: cannotChmod,
           },
           async () => {
             using tmpDir = createTempDir('copies-');
@@ -456,7 +464,7 @@ describe('browser', () => {
         it(
           'rethrows the copy error even when removing the partial copy fails',
           {
-            skip: posixOnly,
+            skip: cannotChmod,
           },
           async () => {
             using tmpDir = createTempDir('copies-');
@@ -486,14 +494,14 @@ describe('browser', () => {
             const orphan = plantCopy(
               tmpDir.path,
               'chrome-devtools-mcp-profile-orphan',
-              String(deadPid()),
+              deadHere(),
             );
             const originalCp = fs.promises.cp;
             sinon.stub(fs.promises, 'cp').callsFake(async (src, dest, opts) => {
               assert.ok(!fs.existsSync(orphan));
               assert.strictEqual(
                 fs.readFileSync(path.join(String(dest), ownerFile), 'utf8'),
-                String(process.pid),
+                here(process.pid),
               );
               return originalCp(src, dest, opts);
             });
@@ -505,7 +513,7 @@ describe('browser', () => {
             assert.ok(copy);
             assert.strictEqual(
               fs.readFileSync(path.join(copy, ownerFile), 'utf8'),
-              String(process.pid),
+              here(process.pid),
             );
           },
         );
@@ -513,7 +521,7 @@ describe('browser', () => {
         it(
           'sweeps only copies whose owner and Chrome are both gone',
           {
-            skip: posixOnly,
+            skip: cannotChmod,
           },
           async () => {
             using tmpDir = createTempDir('copies-');
@@ -521,30 +529,43 @@ describe('browser', () => {
             sinon.stub(os, 'tmpdir').returns(tmpDir.path);
             const profile = profileDir.path;
             fillLockedProfile(profile);
-            const dead = String(deadPid());
-            const live = String(process.pid);
+            const deadNumber = deadPid();
+            const dead = here(deadNumber);
+            const live = here(process.pid);
             const tmp = tmpDir.path;
             const p = 'chrome-devtools-mcp-profile-';
             const swept = [
               plantCopy(tmp, `${p}dead`, dead),
-              plantCopy(tmp, `${p}dead-chrome`, dead, `my-host-name-${dead}`),
+              plantCopy(tmp, `${p}dead-chrome`, dead, dead),
             ];
             const kept = [
               plantCopy(tmp, `${p}live`, live),
-              plantCopy(tmp, `${p}eperm`, '1'),
+              plantCopy(tmp, `${p}eperm`, here(1)),
+              plantCopy(tmp, `${p}zero`, here(0)),
+              plantCopy(tmp, `${p}huge`, here('99999999999999999999')),
+              plantCopy(tmp, `${p}partly-numeric`, here(`${deadNumber}abc`)),
+              plantCopy(tmp, `${p}bare-pid`, String(deadNumber)),
+              plantCopy(tmp, `${p}other-host`, `other-host-${deadNumber}`),
               plantCopy(tmp, `${p}empty`, ''),
               plantCopy(tmp, `${p}garbage`, 'abc'),
               plantCopy(tmp, `${p}unmarked`),
+              plantCopy(tmp, `${p}chrome-live`, dead, live),
               plantCopy(
                 tmp,
-                `${p}chrome-live`,
+                `${p}chrome-other-host`,
                 dead,
-                `${os.hostname()}-${live}`,
+                `other-host-${deadNumber}`,
               ),
-              plantCopy(tmp, `${p}chrome-live-2`, dead, `my-host-name-${live}`),
               plantCopy(tmp, 'chrome-devtools-mcp-other-x', dead),
               plantCopy(tmp, 'chrome-devtools-mcp-profilexy', dead),
             ];
+            const victim = plantCopy(tmp, 'victim', dead);
+            fs.symlinkSync(victim, path.join(tmp, `${p}linked-dir`));
+            const deadFile = path.join(tmp, 'dead-owner');
+            fs.writeFileSync(deadFile, dead);
+            const linkedOwner = plantCopy(tmp, `${p}linked-owner`);
+            fs.symlinkSync(deadFile, path.join(linkedOwner, ownerFile));
+            kept.push(linkedOwner);
             const {manager} = launchOnLock(profile);
 
             await manager.ensureBrowser();
@@ -555,8 +576,67 @@ describe('browser', () => {
             for (const dir of kept) {
               assert.ok(fs.existsSync(dir), `${dir} should be kept`);
             }
+            assert.ok(fs.existsSync(path.join(victim, ownerFile)));
           },
         );
+
+        it(
+          'keeps a copy whose owner file is a FIFO without blocking',
+          {
+            skip: cannotChmod,
+            timeout: 10_000,
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            const fifo = plantCopy(
+              tmpDir.path,
+              'chrome-devtools-mcp-profile-fifo',
+            );
+            execFileSync('mkfifo', [path.join(fifo, ownerFile)]);
+            const {manager, pptrBrowser} = launchOnLock(profile);
+
+            assert.strictEqual(await manager.ensureBrowser(), pptrBrowser);
+            assert.ok(fs.existsSync(fifo));
+          },
+        );
+
+        it('does not sweep on Windows', async () => {
+          using tmpDir = createTempDir('copies-');
+          using profileDir = createTempDir('locked-profile-');
+          sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+          sinon.stub(process, 'platform').value('win32');
+          const profile = profileDir.path;
+          fillLockedProfile(profile);
+          const orphan = plantCopy(
+            tmpDir.path,
+            'chrome-devtools-mcp-profile-orphan',
+            deadHere(),
+          );
+          const {manager} = launchOnLock(profile);
+
+          await manager.ensureBrowser();
+
+          assert.ok(fs.existsSync(orphan));
+        });
+
+        it('launches when the temporary directory cannot be listed', async () => {
+          using tmpDir = createTempDir('copies-');
+          using profileDir = createTempDir('locked-profile-');
+          sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+          const readdir = sinon.stub(fs.promises, 'readdir');
+          readdir.callThrough();
+          readdir.withArgs(tmpDir.path).rejects(new Error('boom'));
+          const profile = profileDir.path;
+          fillLockedProfile(profile);
+          const {manager, pptrBrowser} = launchOnLock(profile);
+
+          assert.strictEqual(await manager.ensureBrowser(), pptrBrowser);
+          sinon.assert.calledWith(readdir, tmpDir.path);
+        });
 
         for (const [onLock, error] of [
           ['fail', 'lock'],
@@ -577,7 +657,7 @@ describe('browser', () => {
               const orphan = plantCopy(
                 tmpDir.path,
                 'chrome-devtools-mcp-profile-orphan',
-                String(deadPid()),
+                deadHere(),
               );
               const launchStub = sinon.stub(puppeteer, 'launch');
               launchStub
@@ -603,7 +683,7 @@ describe('browser', () => {
         it(
           'launches even when sweeping an orphan fails',
           {
-            skip: posixOnly,
+            skip: cannotChmod,
           },
           async () => {
             using tmpDir = createTempDir('copies-');
@@ -614,7 +694,7 @@ describe('browser', () => {
             const orphan = plantCopy(
               tmpDir.path,
               'chrome-devtools-mcp-profile-orphan',
-              String(deadPid()),
+              deadHere(),
             );
             const stuck = path.join(orphan, 'sub');
             fs.mkdirSync(stuck);

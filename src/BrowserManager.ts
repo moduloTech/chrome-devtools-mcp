@@ -408,8 +408,9 @@ export class BrowserManager {
   static readonly profileCopyPrefix = 'chrome-devtools-mcp-profile-';
 
   /**
-   * File in each copy naming the pid of the server that made it, so that a
-   * later server can tell a copy left behind by a killed one.
+   * File in each copy naming the server that made it as `<hostname>-<pid>`,
+   * the format of Chrome's own SingletonLock target, so that a later server
+   * can tell a copy left behind by a killed one.
    */
   static readonly profileCopyOwnerFile = '.chrome-devtools-mcp-owner';
 
@@ -428,7 +429,7 @@ export class BrowserManager {
     try {
       await fs.promises.writeFile(
         path.join(copy, BrowserManager.profileCopyOwnerFile),
-        String(process.pid),
+        `${os.hostname()}-${process.pid}`,
       );
       await fs.promises.cp(userDataDir, copy, {
         recursive: true,
@@ -456,10 +457,15 @@ export class BrowserManager {
 
   /**
    * Removes copies whose server was killed before it could remove them: the
-   * owner pid is gone, and no Chrome still runs on the copy. Anything that
-   * cannot be read as dead is kept; errors never fail the launch.
+   * owner ran on this host and is gone, and no Chrome still runs on the copy.
+   * Anything that cannot be read as dead is kept; errors never fail the
+   * launch. Not on Windows, where nothing tells whether a Chrome still runs
+   * on the copy.
    */
   static async sweepOrphanedProfileCopies(): Promise<void> {
+    if (process.platform === 'win32') {
+      return;
+    }
     const tmp = os.tmpdir();
     let names: string[];
     try {
@@ -474,21 +480,16 @@ export class BrowserManager {
       }
       const dir = path.join(tmp, name);
       try {
-        const owner = await fs.promises.readFile(
+        const owner = await BrowserManager.#readOwnerFile(
           path.join(dir, BrowserManager.profileCopyOwnerFile),
-          'utf8',
         );
-        if (!BrowserManager.#isDeadPid(owner)) {
+        if (owner === undefined || !BrowserManager.#isDeadHere(owner)) {
           continue;
         }
         const chrome = await fs.promises
           .readlink(path.join(dir, 'SingletonLock'))
           .catch(() => undefined);
-        // The lock target is `<hostname>-<pid>`, and hostnames contain dashes.
-        if (
-          chrome !== undefined &&
-          !BrowserManager.#isDeadPid(chrome.slice(chrome.lastIndexOf('-') + 1))
-        ) {
+        if (chrome !== undefined && !BrowserManager.#isDeadHere(chrome)) {
           continue;
         }
         await fs.promises.rm(dir, {recursive: true, force: true});
@@ -499,15 +500,46 @@ export class BrowserManager {
     }
   }
 
-  static #isDeadPid(text: string): boolean {
-    if (!/^\d+$/.test(text.trim())) {
+  /**
+   * Reads the first bytes of an owner file. Without O_NOFOLLOW and O_NONBLOCK,
+   * a symlink or a FIFO planted in a shared temporary directory would be
+   * followed or block the read forever; a FIFO reads as empty instead.
+   */
+  static async #readOwnerFile(file: string): Promise<string | undefined> {
+    const {O_RDONLY, O_NOFOLLOW, O_NONBLOCK} = fs.constants;
+    const handle = await fs.promises
+      .open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+      .catch(() => undefined);
+    if (!handle) {
+      return undefined;
+    }
+    try {
+      const buffer = Buffer.alloc(256);
+      const {bytesRead} = await handle.read(buffer, 0, buffer.length, 0);
+      return buffer.toString('utf8', 0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Whether `<hostname>-<pid>` names a process of this host that is gone.
+   * Only ESRCH counts as gone: EPERM means it exists under another user, and
+   * kill() rejects pids out of range with other errors. A pid from another
+   * host says nothing about this one.
+   */
+  static #isDeadHere(target: string): boolean {
+    const text = target.trim();
+    // Hostnames contain dashes; the pid is what follows the last one.
+    const dash = text.lastIndexOf('-');
+    const pid = text.slice(dash + 1);
+    if (text.slice(0, dash) !== os.hostname() || !/^\d+$/.test(pid)) {
       return false;
     }
     try {
-      process.kill(Number(text.trim()), 0);
+      process.kill(Number(pid), 0);
       return false;
     } catch (error) {
-      // EPERM means the process exists but belongs to someone else.
       return (
         error instanceof Error && 'code' in error && error.code === 'ESRCH'
       );
