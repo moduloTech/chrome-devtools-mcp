@@ -5,6 +5,7 @@
  */
 
 import assert from 'node:assert';
+import {spawnSync} from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -210,6 +211,18 @@ describe('browser', () => {
         fs.writeFileSync(path.join(dir, 'Default', 'Cache', 'blob'), 'cache');
         fs.writeFileSync(path.join(dir, 'Local State'), '{}');
         fs.symlinkSync('otherhost-12345', path.join(dir, 'SingletonLock'));
+        fs.symlinkSync(
+          '/nonexistent/socket',
+          path.join(dir, 'SingletonSocket'),
+        );
+        fs.symlinkSync(
+          '/nonexistent/cookie',
+          path.join(dir, 'SingletonCookie'),
+        );
+      }
+
+      function assertMissing(file: string): void {
+        assert.throws(() => fs.lstatSync(file), {code: 'ENOENT'});
       }
 
       it('fails with the lock error by default', async () => {
@@ -281,7 +294,9 @@ describe('browser', () => {
         assert.ok(fs.existsSync(path.join(copy, 'Local State')));
         assert.ok(!fs.existsSync(path.join(copy, 'Default', 'Cache')));
         assert.ok(!fs.existsSync(path.join(copy, 'Default', 'Code Cache')));
-        assert.ok(!fs.existsSync(path.join(copy, 'SingletonLock')));
+        assertMissing(path.join(copy, 'SingletonLock'));
+        assertMissing(path.join(copy, 'SingletonSocket'));
+        assertMissing(path.join(copy, 'SingletonCookie'));
       });
 
       it('removes the profile copy once the browser disconnects', async () => {
@@ -348,6 +363,272 @@ describe('browser', () => {
 
         await assert.rejects(manager.ensureBrowser(), /some other failure/);
         sinon.assert.calledOnce(launchStub);
+      });
+
+      describe('profile copies', () => {
+        const ownerFile = '.chrome-devtools-mcp-owner';
+        const posixOnly =
+          process.platform === 'win32' || process.getuid?.() === 0;
+
+        function deadPid(): number {
+          return spawnSync(process.execPath, ['-e', '']).pid;
+        }
+
+        function copiesIn(dir: string): string[] {
+          return fs
+            .readdirSync(dir)
+            .filter(name => name.startsWith('chrome-devtools-mcp-profile-'));
+        }
+
+        function plantCopy(
+          tmp: string,
+          name: string,
+          owner?: string,
+          lockTarget?: string,
+        ): string {
+          const dir = path.join(tmp, name);
+          fs.mkdirSync(path.join(dir, 'Default'), {recursive: true});
+          if (owner !== undefined) {
+            fs.writeFileSync(path.join(dir, ownerFile), owner);
+          }
+          if (lockTarget !== undefined) {
+            fs.symlinkSync(lockTarget, path.join(dir, 'SingletonLock'));
+          }
+          return dir;
+        }
+
+        function launchOnLock(profile: string, onLock = 'copy') {
+          const pptrBrowser = createMockPuppeteerBrowser();
+          const launchStub = sinon.stub(puppeteer, 'launch');
+          launchStub.onFirstCall().rejects(lockedError(profile));
+          launchStub.onSecondCall().resolves(pptrBrowser);
+          const manager = new BrowserManager(
+            createMockParsedArguments({
+              userDataDir: profile,
+              userDataDirOnLock: onLock,
+            }),
+          );
+          return {manager, launchStub, pptrBrowser};
+        }
+
+        it('does not copy the root lockfile, even with a trailing separator', async () => {
+          using tmpDir = createTempDir('copies-');
+          using profileDir = createTempDir('locked-profile-');
+          sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+          const profile = profileDir.path;
+          fillLockedProfile(profile);
+          fs.writeFileSync(path.join(profile, 'lockfile'), '');
+          fs.writeFileSync(path.join(profile, 'Default', 'lockfile'), 'kept');
+          const {manager, launchStub} = launchOnLock(profile + path.sep);
+
+          await manager.ensureBrowser();
+
+          const copy = launchStub.secondCall.args[0]?.userDataDir;
+          assert.ok(copy);
+          assertMissing(path.join(copy, 'lockfile'));
+          assert.strictEqual(
+            fs.readFileSync(path.join(copy, 'Default', 'lockfile'), 'utf8'),
+            'kept',
+          );
+        });
+
+        it(
+          'removes a partial copy and rethrows the copy error',
+          {
+            skip: posixOnly,
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            fs.writeFileSync(path.join(profile, 'unreadable'), 'x', {mode: 0});
+            const {manager, launchStub} = launchOnLock(profile);
+
+            await assert.rejects(manager.ensureBrowser(), {code: 'EACCES'});
+
+            sinon.assert.calledOnce(launchStub);
+            assert.deepStrictEqual(copiesIn(tmpDir.path), []);
+          },
+        );
+
+        it(
+          'rethrows the copy error even when removing the partial copy fails',
+          {
+            skip: posixOnly,
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            sinon.stub(fs.promises, 'rm').rejects(new Error('rm failed'));
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            fs.writeFileSync(path.join(profile, 'unreadable'), 'x', {mode: 0});
+            const {manager} = launchOnLock(profile);
+
+            await assert.rejects(manager.ensureBrowser(), {code: 'EACCES'});
+          },
+        );
+
+        it(
+          'marks the copy with its owner and sweeps orphans before copying',
+          {
+            skip: process.platform === 'win32',
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            const orphan = plantCopy(
+              tmpDir.path,
+              'chrome-devtools-mcp-profile-orphan',
+              String(deadPid()),
+            );
+            const originalCp = fs.promises.cp;
+            sinon.stub(fs.promises, 'cp').callsFake(async (src, dest, opts) => {
+              assert.ok(!fs.existsSync(orphan));
+              assert.strictEqual(
+                fs.readFileSync(path.join(String(dest), ownerFile), 'utf8'),
+                String(process.pid),
+              );
+              return originalCp(src, dest, opts);
+            });
+            const {manager, launchStub} = launchOnLock(profile);
+
+            await manager.ensureBrowser();
+
+            const copy = launchStub.secondCall.args[0]?.userDataDir;
+            assert.ok(copy);
+            assert.strictEqual(
+              fs.readFileSync(path.join(copy, ownerFile), 'utf8'),
+              String(process.pid),
+            );
+          },
+        );
+
+        it(
+          'sweeps only copies whose owner and Chrome are both gone',
+          {
+            skip: posixOnly,
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            const dead = String(deadPid());
+            const live = String(process.pid);
+            const tmp = tmpDir.path;
+            const p = 'chrome-devtools-mcp-profile-';
+            const swept = [
+              plantCopy(tmp, `${p}dead`, dead),
+              plantCopy(tmp, `${p}dead-chrome`, dead, `my-host-name-${dead}`),
+            ];
+            const kept = [
+              plantCopy(tmp, `${p}live`, live),
+              plantCopy(tmp, `${p}eperm`, '1'),
+              plantCopy(tmp, `${p}empty`, ''),
+              plantCopy(tmp, `${p}garbage`, 'abc'),
+              plantCopy(tmp, `${p}unmarked`),
+              plantCopy(
+                tmp,
+                `${p}chrome-live`,
+                dead,
+                `${os.hostname()}-${live}`,
+              ),
+              plantCopy(tmp, `${p}chrome-live-2`, dead, `my-host-name-${live}`),
+              plantCopy(tmp, 'chrome-devtools-mcp-other-x', dead),
+              plantCopy(tmp, 'chrome-devtools-mcp-profilexy', dead),
+            ];
+            const {manager} = launchOnLock(profile);
+
+            await manager.ensureBrowser();
+
+            for (const dir of swept) {
+              assertMissing(dir);
+            }
+            for (const dir of kept) {
+              assert.ok(fs.existsSync(dir), `${dir} should be kept`);
+            }
+          },
+        );
+
+        for (const [onLock, error] of [
+          ['fail', 'lock'],
+          ['isolated', 'lock'],
+          ['copy', 'other'],
+        ]) {
+          it(
+            `does not sweep with userDataDirOnLock=${onLock} on a ${error} error`,
+            {
+              skip: process.platform === 'win32',
+            },
+            async () => {
+              using tmpDir = createTempDir('copies-');
+              using profileDir = createTempDir('locked-profile-');
+              sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+              const profile = profileDir.path;
+              fillLockedProfile(profile);
+              const orphan = plantCopy(
+                tmpDir.path,
+                'chrome-devtools-mcp-profile-orphan',
+                String(deadPid()),
+              );
+              const launchStub = sinon.stub(puppeteer, 'launch');
+              launchStub
+                .onFirstCall()
+                .rejects(
+                  error === 'lock' ? lockedError(profile) : new Error('other'),
+                );
+              launchStub.onSecondCall().resolves(createMockPuppeteerBrowser());
+              const manager = new BrowserManager(
+                createMockParsedArguments({
+                  userDataDir: profile,
+                  userDataDirOnLock: onLock,
+                }),
+              );
+
+              await manager.ensureBrowser().catch(() => undefined);
+
+              assert.ok(fs.existsSync(orphan));
+            },
+          );
+        }
+
+        it(
+          'launches even when sweeping an orphan fails',
+          {
+            skip: posixOnly,
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            const orphan = plantCopy(
+              tmpDir.path,
+              'chrome-devtools-mcp-profile-orphan',
+              String(deadPid()),
+            );
+            const stuck = path.join(orphan, 'sub');
+            fs.mkdirSync(stuck);
+            fs.writeFileSync(path.join(stuck, 'file'), '');
+            fs.chmodSync(stuck, 0o500);
+            try {
+              const {manager, pptrBrowser} = launchOnLock(profile);
+
+              assert.strictEqual(await manager.ensureBrowser(), pptrBrowser);
+            } finally {
+              fs.chmodSync(stuck, 0o700);
+            }
+          },
+        );
       });
     });
 
