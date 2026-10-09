@@ -501,9 +501,11 @@ export class BrowserManager {
   }
 
   /**
-   * Reads the first bytes of an owner file. Without O_NOFOLLOW and O_NONBLOCK,
+   * Reads an owner file of a bounded size. Without O_NOFOLLOW and O_NONBLOCK,
    * a symlink or a FIFO planted in a shared temporary directory would be
-   * followed or block the read forever; a FIFO reads as empty instead.
+   * followed or block the read forever; a FIFO reads as empty instead. A
+   * file that fills the buffer may have been cut inside its pid, so it is
+   * not read at all (hostnames are at most 255 bytes).
    */
   static async #readOwnerFile(file: string): Promise<string | undefined> {
     const {O_RDONLY, O_NOFOLLOW, O_NONBLOCK} = fs.constants;
@@ -514,8 +516,11 @@ export class BrowserManager {
       return undefined;
     }
     try {
-      const buffer = Buffer.alloc(256);
+      const buffer = Buffer.alloc(512);
       const {bytesRead} = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead === buffer.length) {
+        return undefined;
+      }
       return buffer.toString('utf8', 0, bytesRead);
     } finally {
       await handle.close();

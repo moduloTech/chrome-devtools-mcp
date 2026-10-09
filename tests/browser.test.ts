@@ -604,6 +604,36 @@ describe('browser', () => {
           },
         );
 
+        it(
+          'keeps a copy whose owner file may have been read truncated',
+          {
+            skip: process.platform === 'win32',
+          },
+          async () => {
+            using tmpDir = createTempDir('copies-');
+            using profileDir = createTempDir('locked-profile-');
+            sinon.stub(os, 'tmpdir').returns(tmpDir.path);
+            const pid = String(deadPid());
+            sinon
+              .stub(os, 'hostname')
+              .returns('h'.repeat(512 - 1 - pid.length));
+            const profile = profileDir.path;
+            fillLockedProfile(profile);
+            const owner = here(pid);
+            assert.strictEqual(owner.length, 512);
+            const copy = plantCopy(
+              tmpDir.path,
+              'chrome-devtools-mcp-profile-long',
+              owner,
+            );
+            const {manager} = launchOnLock(profile);
+
+            await manager.ensureBrowser();
+
+            assert.ok(fs.existsSync(copy));
+          },
+        );
+
         it('does not sweep on Windows', async () => {
           using tmpDir = createTempDir('copies-');
           using profileDir = createTempDir('locked-profile-');
