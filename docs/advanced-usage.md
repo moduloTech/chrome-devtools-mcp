@@ -32,7 +32,9 @@ deviate when another session holds it, pass `--userDataDirOnLock` instead:
   profile (caches left out), so the session starts with the same cookies and
   storage. Whatever it changes is discarded: the copy is deleted when the browser
   closes. The copy holds the profile's session cookies; it is created with mode
-  `0700` under the system temporary directory.
+  `0700` under the system temporary directory. A copy left behind by a server
+  that was killed is removed by the next copy launch, once neither that server
+  nor a browser still runs on it.
 - `--userDataDirOnLock=isolated` falls back to a temporary empty profile, as
   `--isolated` would.
 - `--userDataDirOnLock=fail` (the default) reports that the browser is already

@@ -405,27 +405,113 @@ export class BrowserManager {
     'Crashpad',
   ]);
 
+  static readonly profileCopyPrefix = 'chrome-devtools-mcp-profile-';
+
+  /**
+   * File in each copy naming the pid of the server that made it, so that a
+   * later server can tell a copy left behind by a killed one.
+   */
+  static readonly profileCopyOwnerFile = '.chrome-devtools-mcp-owner';
+
   /**
    * Copies a profile that another Chrome instance holds into a fresh private
    * temporary directory (mkdtemp creates it with mode 0700), leaving out
-   * caches and the Singleton* files that mark the original as in use.
+   * caches and the files that mark the original as in use: Singleton* on
+   * macOS and Linux, the root lockfile on Windows. A failed copy is removed.
    */
   static async copyProfile(userDataDir: string): Promise<string> {
+    await BrowserManager.sweepOrphanedProfileCopies();
     const copy = await fs.promises.mkdtemp(
-      path.join(os.tmpdir(), 'chrome-devtools-mcp-profile-'),
+      path.join(os.tmpdir(), BrowserManager.profileCopyPrefix),
     );
-    await fs.promises.cp(userDataDir, copy, {
-      recursive: true,
-      verbatimSymlinks: true,
-      filter: source => {
-        const name = path.basename(source);
-        return (
-          !name.startsWith('Singleton') &&
-          !BrowserManager.profileCopySkippedDirs.has(name)
-        );
-      },
-    });
+    const root = path.resolve(userDataDir);
+    try {
+      await fs.promises.writeFile(
+        path.join(copy, BrowserManager.profileCopyOwnerFile),
+        String(process.pid),
+      );
+      await fs.promises.cp(userDataDir, copy, {
+        recursive: true,
+        verbatimSymlinks: true,
+        filter: source => {
+          const name = path.basename(source);
+          const atRoot = path.dirname(path.resolve(source)) === root;
+          return (
+            !name.startsWith('Singleton') &&
+            !(atRoot && name === 'lockfile') &&
+            !BrowserManager.profileCopySkippedDirs.has(name)
+          );
+        },
+      });
+    } catch (error) {
+      await fs.promises
+        .rm(copy, {recursive: true, force: true, maxRetries: 5})
+        .catch(rmError => {
+          logger?.(`Could not remove the partial copy at ${copy}: ${rmError}`);
+        });
+      throw error;
+    }
     return copy;
+  }
+
+  /**
+   * Removes copies whose server was killed before it could remove them: the
+   * owner pid is gone, and no Chrome still runs on the copy. Anything that
+   * cannot be read as dead is kept; errors never fail the launch.
+   */
+  static async sweepOrphanedProfileCopies(): Promise<void> {
+    const tmp = os.tmpdir();
+    let names: string[];
+    try {
+      names = await fs.promises.readdir(tmp);
+    } catch (error) {
+      logger?.(`Could not list ${tmp} for orphaned profile copies: ${error}`);
+      return;
+    }
+    for (const name of names) {
+      if (!name.startsWith(BrowserManager.profileCopyPrefix)) {
+        continue;
+      }
+      const dir = path.join(tmp, name);
+      try {
+        const owner = await fs.promises.readFile(
+          path.join(dir, BrowserManager.profileCopyOwnerFile),
+          'utf8',
+        );
+        if (!BrowserManager.#isDeadPid(owner)) {
+          continue;
+        }
+        const chrome = await fs.promises
+          .readlink(path.join(dir, 'SingletonLock'))
+          .catch(() => undefined);
+        // The lock target is `<hostname>-<pid>`, and hostnames contain dashes.
+        if (
+          chrome !== undefined &&
+          !BrowserManager.#isDeadPid(chrome.slice(chrome.lastIndexOf('-') + 1))
+        ) {
+          continue;
+        }
+        await fs.promises.rm(dir, {recursive: true, force: true});
+        logger?.(`Removed orphaned profile copy ${dir}`);
+      } catch (error) {
+        logger?.(`Left profile copy ${dir} in place: ${error}`);
+      }
+    }
+  }
+
+  static #isDeadPid(text: string): boolean {
+    if (!/^\d+$/.test(text.trim())) {
+      return false;
+    }
+    try {
+      process.kill(Number(text.trim()), 0);
+      return false;
+    } catch (error) {
+      // EPERM means the process exists but belongs to someone else.
+      return (
+        error instanceof Error && 'code' in error && error.code === 'ESRCH'
+      );
+    }
   }
 
   async #connect(): Promise<Browser> {
